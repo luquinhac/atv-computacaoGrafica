@@ -7,9 +7,13 @@ import time
 # =====================
 # CONFIGURAÇÕES
 # =====================
-CONF_THRESHOLD = 0.4
-IOU_THRESHOLD  = 0.5
-SOURCE = 0   # Webcam: troque por 0 (int)
+CONF_THRESHOLD  = 0.4
+IOU_THRESHOLD   = 0.5
+SOURCE          = 0             # Webcam: 0 | Imagem: 'imagem.jpg'
+
+# --- Performance ---
+INFER_WIDTH     = 480           # Largura do frame enviado ao YOLO (menor = mais rápido)
+YOLO_SKIP       = 2             # Roda YOLO a cada N frames (1 = sem skip)
 
 # =====================
 # INICIALIZAÇÃO
@@ -35,9 +39,15 @@ cap = cv2.VideoCapture(SOURCE)
 if not cap.isOpened():
     raise RuntimeError(f"[Erro] Nao foi possivel abrir a fonte: {SOURCE}")
 
-fps_counter = 0
-fps_display = 0
-start_time  = time.time()
+cap.set(cv2.CAP_PROP_FPS, 60)
+
+fps_counter  = 0
+fps_display  = 0
+start_time   = time.time()
+frame_count  = 0                        # contador para o frame skip
+last_boxes   = None                     # cache do último resultado YOLO
+last_xyxy    = np.empty((0, 4), int)    # cache das coordenadas escaladas
+last_names   = {}                       # cache dos nomes de classe
 
 print("[Sistema] Iniciando... Pressione 'q' para sair.")
 
@@ -150,16 +160,42 @@ try:
                                    cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         thresh_bgr = cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)
 
-        # ── ETAPA 6 — IA: única inferência via model.track() ─────
-        # FIX 2: model.track() já faz detecção + rastreamento.
-        # Chamar model() separadamente era redundante e dobrava o custo.
-        results = model.track(
-            frame, persist=True,
-            conf=CONF_THRESHOLD, iou=IOU_THRESHOLD,
-            verbose=False
-        )
-        boxes = results[0].boxes
-        names = results[0].names   # {0: 'person', 5: 'bus', ...}
+        # ── ETAPA 6 — IA com inferência otimizada ────────────────
+        frame_count += 1
+        h_orig, w_orig = frame.shape[:2]
+
+        if frame_count % YOLO_SKIP == 0:
+            # Reduz resolução só para a inferência — menos pixels, mais FPS
+            scale       = INFER_WIDTH / w_orig
+            infer_h     = int(h_orig * scale)
+            frame_small = cv2.resize(frame, (INFER_WIDTH, infer_h))
+
+            results = model.track(
+                frame_small, persist=True,
+                conf=CONF_THRESHOLD, iou=IOU_THRESHOLD,
+                verbose=False
+            )
+            raw_boxes = results[0].boxes
+
+            # Boxes é somente-leitura: escala as coordenadas num array separado
+            if len(raw_boxes):
+                coords = raw_boxes.xyxy.cpu().numpy().copy()
+                coords[:, [0, 2]] /= scale   # x1, x2
+                coords[:, [1, 3]] /= scale   # y1, y2
+            else:
+                coords = raw_boxes.xyxy.cpu().numpy()
+
+            last_boxes = raw_boxes
+            last_xyxy  = coords.astype(int)
+            last_names = results[0].names
+
+        # Usa resultado atual ou cacheado (frames sem inferência)
+        boxes = last_boxes
+        xyxy  = last_xyxy
+        names = last_names
+
+        if boxes is None:
+            continue
 
         # FPS
         fps_counter += 1
@@ -178,7 +214,7 @@ try:
         for i in range(count_frame):
             cls_id      = int(boxes.cls[i])
             conf        = float(boxes.conf[i])
-            x1, y1, x2, y2 = map(int, boxes.xyxy[i])
+            x1, y1, x2, y2 = xyxy[i]
 
             if cls_id == 0:   # pessoa → detecta rosto com Haar
                 face = get_face_box(gray, x1, y1, x2, y2)
@@ -229,7 +265,7 @@ try:
             if int(boxes.cls[i]) != 0:
                 continue   # filtra somente pessoas para este painel
 
-            x1, y1, x2, y2 = map(int, boxes.xyxy[i])
+            x1, y1, x2, y2 = xyxy[i]
             conf            = float(boxes.conf[i])
             obj_id          = int(boxes.id[i]) if has_ids else -1
 
