@@ -4,36 +4,25 @@ import matplotlib.pyplot as plt
 from ultralytics import YOLO
 import time
 
-# =====================
-# CONFIGURAÇÕES
-# =====================
 CONF_THRESHOLD  = 0.4
 IOU_THRESHOLD   = 0.5
-SOURCE          = 0             # Webcam: 0 | Imagem: 'imagem.jpg'
+SOURCE          = 'imagem.jpg'
 
-# --- Performance ---
-INFER_WIDTH     = 480           # Largura do frame enviado ao YOLO (menor = mais rápido)
-YOLO_SKIP       = 2             # Roda YOLO a cada N frames (1 = sem skip)
+is_image = isinstance(SOURCE, str) and SOURCE.lower().endswith(
+    ('.jpg', '.jpeg', '.png', '.bmp', '.webp')
+)
+is_live = isinstance(SOURCE, int)
 
-# =====================
-# INICIALIZAÇÃO
-# =====================
+INFER_WIDTH     = 480
+YOLO_SKIP       = 1 if is_image else 2
+
 model = YOLO("yolov8n.pt")
 
-# Detector de faces Haar — já vem embutido no OpenCV, sem instalar nada
 face_cascade = cv2.CascadeClassifier(
     cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
 )
 if face_cascade.empty():
     raise RuntimeError("[Erro] haarcascade_frontalface_default.xml nao encontrado.")
-
-# FIX 1: lógica correta de tipo de fonte
-# int  → webcam ao vivo
-# str  → imagem estática ou arquivo de vídeo
-is_image = isinstance(SOURCE, str) and SOURCE.lower().endswith(
-    ('.jpg', '.jpeg', '.png', '.bmp', '.webp')
-)
-is_live = isinstance(SOURCE, int)
 
 cap = cv2.VideoCapture(SOURCE)
 if not cap.isOpened():
@@ -44,24 +33,18 @@ cap.set(cv2.CAP_PROP_FPS, 60)
 fps_counter  = 0
 fps_display  = 0
 start_time   = time.time()
-frame_count  = 0                        # contador para o frame skip
-last_boxes   = None                     # cache do último resultado YOLO
-last_xyxy    = np.empty((0, 4), int)    # cache das coordenadas escaladas
-last_names   = {}                       # cache dos nomes de classe
+frame_count  = 0
+last_boxes   = None
+last_xyxy    = np.empty((0, 4), int)
+last_names   = {}
 
-print("[Sistema] Iniciando... Pressione 'q' para sair.")
-
-
-# ──────────────────────────────────────────────
-# UTILITÁRIOS DE LAYOUT
-# ──────────────────────────────────────────────
+print("[Sistema] Iniciando... Pressione 'q' na janela para sair.")
 
 def add_header(img, titulo):
     header = np.full((36, img.shape[1], 3), (25, 25, 40), dtype=np.uint8)
     cv2.putText(header, titulo, (10, 25),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.75, (200, 200, 255), 2)
     return np.vstack([header, img])
-
 
 def pad_to_height(img, target_h):
     dh = target_h - img.shape[0]
@@ -70,22 +53,10 @@ def pad_to_height(img, target_h):
                                  cv2.BORDER_CONSTANT, value=(20, 20, 20))
     return img
 
-
-# FIX 8: função definida UMA VEZ fora do loop
 def resize_panel(img, w, h):
     return cv2.resize(img, (w, h))
 
-
-# ──────────────────────────────────────────────
-# LÓGICA DE DETECÇÃO
-# ──────────────────────────────────────────────
-
 def get_face_box(frame_gray, x1, y1, x2, y2):
-    """
-    Detecta o rosto dentro da bbox da pessoa usando Haar Cascade (OpenCV).
-    Se não encontrar nenhum rosto, retorna None — o caller ignora a detecção.
-    """
-    # Recorta a região da pessoa no frame em escala de cinza
     roi = frame_gray[y1:y2, x1:x2]
     if roi.size == 0:
         return None
@@ -100,12 +71,9 @@ def get_face_box(frame_gray, x1, y1, x2, y2):
     if len(faces) == 0:
         return None
 
-    # Pega o rosto de maior área (mais provável de ser o principal)
     fx, fy, fw, fh = max(faces, key=lambda f: f[2] * f[3])
 
-    # Converte coordenadas do ROI para coordenadas do frame completo
     return x1 + fx, y1 + fy, x1 + fx + fw, y1 + fy + fh
-
 
 def classificar_imagem(media_intensidade):
     if media_intensidade > 180:
@@ -114,33 +82,24 @@ def classificar_imagem(media_intensidade):
         return "Media luminosidade"
     return "Escura / Baixa luminosidade"
 
-
-# ──────────────────────────────────────────────
-# LOOP PRINCIPAL
-# ──────────────────────────────────────────────
-
-# FIX 6: try/finally garante liberação do recurso mesmo em caso de exceção
 try:
     while True:
         ret, frame = cap.read()
         if not ret:
-            if is_image:               # tenta reler imagem estática
+            if is_image:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
                 ret, frame = cap.read()
             if not ret:
                 break
 
-        # ── ETAPA 2 — Processamento ──────────────────────────────
         gray  = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         blur  = cv2.GaussianBlur(gray, (5, 5), 0)
-        # Thresholds dinâmicos: se a imagem for escura, usa valores menores
-        # para que o Canny ainda consiga encontrar bordas significativas
+        
         media_blur = float(blur.mean())
         canny_lo   = max(int(media_blur * 0.4), 10)
         canny_hi   = max(int(media_blur * 1.2), 30)
         edges      = cv2.Canny(blur, canny_lo, canny_hi)
 
-        # ── ETAPA 3 — HSV ────────────────────────────────────────
         hsv     = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         hsv_mod = hsv.copy()
         hsv_mod[:, :, 1] = np.clip(
@@ -149,23 +108,17 @@ try:
         frame_saturado = cv2.cvtColor(hsv_mod, cv2.COLOR_HSV2BGR)
         canal_v        = cv2.cvtColor(hsv[:, :, 2], cv2.COLOR_GRAY2BGR)
 
-        # ── ETAPA 4 — Intensidade média ──────────────────────────
         intensidade_media = float(gray.mean())
         tipo_imagem       = classificar_imagem(intensidade_media)
 
-        # ── ETAPA 5 — Binarização ────────────────────────────────
-        # OTSU calcula automaticamente o limiar ideal para qualquer
-        # nível de brilho, evitando imagens completamente pretas
         _, thresh  = cv2.threshold(gray, 0, 255,
                                    cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         thresh_bgr = cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)
 
-        # ── ETAPA 6 — IA com inferência otimizada ────────────────
         frame_count += 1
         h_orig, w_orig = frame.shape[:2]
 
         if frame_count % YOLO_SKIP == 0:
-            # Reduz resolução só para a inferência — menos pixels, mais FPS
             scale       = INFER_WIDTH / w_orig
             infer_h     = int(h_orig * scale)
             frame_small = cv2.resize(frame, (INFER_WIDTH, infer_h))
@@ -177,11 +130,10 @@ try:
             )
             raw_boxes = results[0].boxes
 
-            # Boxes é somente-leitura: escala as coordenadas num array separado
             if len(raw_boxes):
                 coords = raw_boxes.xyxy.cpu().numpy().copy()
-                coords[:, [0, 2]] /= scale   # x1, x2
-                coords[:, [1, 3]] /= scale   # y1, y2
+                coords[:, [0, 2]] /= scale
+                coords[:, [1, 3]] /= scale
             else:
                 coords = raw_boxes.xyxy.cpu().numpy()
 
@@ -189,7 +141,6 @@ try:
             last_xyxy  = coords.astype(int)
             last_names = results[0].names
 
-        # Usa resultado atual ou cacheado (frames sem inferência)
         boxes = last_boxes
         xyxy  = last_xyxy
         names = last_names
@@ -197,7 +148,6 @@ try:
         if boxes is None:
             continue
 
-        # FPS
         fps_counter += 1
         elapsed = time.time() - start_time
         if elapsed >= 1.0:
@@ -205,21 +155,19 @@ try:
             fps_counter = 0
             start_time  = time.time()
 
-        # ── DASHBOARD — todos os objetos detectados ───────────────
         dashboard          = frame.copy()
         count_frame        = len(boxes)
         rostos_encontrados = 0
 
-        # FIX 3: itera TODAS as detecções (sem filtro por classe)
         for i in range(count_frame):
             cls_id      = int(boxes.cls[i])
             conf        = float(boxes.conf[i])
             x1, y1, x2, y2 = xyxy[i]
 
-            if cls_id == 0:   # pessoa → detecta rosto com Haar
+            if cls_id == 0:
                 face = get_face_box(gray, x1, y1, x2, y2)
                 if face is None:
-                    continue   # YOLO detectou pessoa mas Haar não achou rosto
+                    continue
                 fx1, fy1, fx2, fy2 = face
                 cv2.rectangle(dashboard, (fx1, fy1), (fx2, fy2), (0, 255, 255), 2)
                 label = f"rosto {conf:.2f}"
@@ -230,7 +178,7 @@ try:
                 cv2.putText(dashboard, label, (fx1 + 2, max(fy1 - 4, 10)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
                 rostos_encontrados += 1
-            else:             # objeto genérico
+            else:
                 cv2.rectangle(dashboard, (x1, y1), (x2, y2), (255, 165, 0), 2)
                 label = f"{names.get(cls_id, str(cls_id))} {conf:.2f}"
                 (lw, lh), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
@@ -240,7 +188,6 @@ try:
                 cv2.putText(dashboard, label, (x1 + 2, max(y1 - 4, 10)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
 
-        # Overlay métricas
         overlay = dashboard.copy()
         cv2.rectangle(overlay, (0, 0), (260, 120), (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.55, dashboard, 0.45, 0, dashboard)
@@ -250,7 +197,6 @@ try:
         cv2.putText(dashboard, f"Int: {intensidade_media:.1f}/255",      (10, 88),  cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 200, 0), 2)
         cv2.putText(dashboard, tipo_imagem,                              (10, 108), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 200, 0), 1)
 
-        # ── TRACKING — somente pessoas, com IDs persistentes ─────
         tracking = frame.copy()
         overlay_trk = tracking.copy()
         cv2.rectangle(overlay_trk, (0, 0),
@@ -260,10 +206,9 @@ try:
         rostos_rastreados = 0
         has_ids           = boxes.id is not None
 
-        # FIX 4: itera TODAS as pessoas rastreadas (não apenas argmax)
         for i in range(count_frame):
             if int(boxes.cls[i]) != 0:
-                continue   # filtra somente pessoas para este painel
+                continue
 
             x1, y1, x2, y2 = xyxy[i]
             conf            = float(boxes.conf[i])
@@ -271,7 +216,7 @@ try:
 
             face = get_face_box(gray, x1, y1, x2, y2)
             if face is None:
-                continue   # pessoa visível mas sem rosto detectável (de costas, etc.)
+                continue
             fx1, fy1, fx2, fy2 = face
             cv2.rectangle(tracking, (fx1, fy1), (fx2, fy2), (255, 0, 255), 2)
 
@@ -296,7 +241,6 @@ try:
                     (10, tracking.shape[0] - 15),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.60, (255, 0, 255), 2)
 
-        # ── ETAPA 7 — Canvas final ───────────────────────────────
         dashboard_h = add_header(dashboard, "Dashboard IA  |  Rosto + Objetos")
         tracking_h  = add_header(tracking,  "Tracking IA   |  Somente Rosto")
 
@@ -330,21 +274,20 @@ try:
         canvas_show = cv2.resize(canvas, (0, 0), fx=0.6, fy=0.6)
         cv2.imshow("Sistema Inteligente de Analise de Imagens com IA", canvas_show)
 
-        # FIX 1: waitKey correto agora que is_live funciona
-        key = cv2.waitKey(1 if is_live else 30) & 0xFF
-        if key == ord('q'):
-            break
         if is_image:
-            cv2.waitKey(6000)
+            print("\n[Info] Imagem processada com sucesso. A janela do OpenCV está aberta.")
+            print("[Info] Pressione QUALQUER TECLA (com a janela em foco) para fechá-la e abrir o Histograma.")
+            cv2.waitKey(0)
             break
+        else:
+            key = cv2.waitKey(1 if is_live else 30) & 0xFF
+            if key == ord('q'):
+                break
 
 finally:
-    # FIX 6: sempre libera a câmera, mesmo em caso de exceção
     cap.release()
     cv2.destroyAllWindows()
 
-# ── ETAPA 4 — Histograma (exibido ao final) ──────────────────
-# FIX 5: guard para não crashar quando SOURCE é webcam (int)
 if is_image:
     frame_final = cv2.imread(SOURCE)
     if frame_final is None:
